@@ -1,0 +1,1947 @@
+
+rm(list=ls())
+setwd("C:/Users/Erik/Desktop/R")
+
+library(momentuHMM)
+library(move)
+library(dplyr)
+
+## imports data
+
+amwo_male<- read.csv("amwo_male.csv")
+
+## Create year-specific Bird ID 
+
+amwo_male$ID2<- amwo_male$ID
+
+amwo_male$year<- strftime(amwo_male$time, format="%Y")
+
+amwo_male$ID<- as.factor(paste(amwo_male$ID2, amwo_male$year, sep="-"))
+
+##remove some birds that are non-migrants based on first-pass filter of hmm models 
+
+remove.male.list <- as.list(c("FL-2021-01-2021", "RI-2019-24-2020", "RI-2019-28-2020")) 
+
+amwo_male <- amwo_male %>% filter(!(ID %in% remove.male.list))
+
+  
+##############################################################  
+# create monentuHMMData object
+
+amwo_male$x <-amwo_male$lon
+amwo_male$y <-amwo_male$lat
+amwoData <- prepData(amwo_male, type = "LL")
+amwoData$step <- round(amwoData$step, digits = 2)
+
+#plot step length.  Log transformation is insightful 
+
+hist(log(amwoData$step), breaks=60)
+
+## remove birds with no individual step lengths >16.1 km.  
+## in practice this pulls birds that never initiate a substantial migratory movement
+## but doesn't penalize birds that DO migrate, as they always make 
+## at least one substantial movement.
+
+amwoData$min.step<- ifelse(amwoData$step>16.1, 1,0)
+
+amwoData<-amwoData[(amwoData$ID %in% amwoData$ID [amwoData$min.step == 1]) , ]
+
+## revised sample sizes
+
+amwoData$ID<- droplevels(amwoData$ID)
+
+## Add a 'residency' term, which provides the length of time since the last migratory step 
+
+#Don't end up using this but handy to retain
+
+amwoData$residency.length[1]<- 1
+
+for (i in 2:nrow(amwoData)){
+  amwoData$residency.length[i]<- ifelse(amwoData$ID2[i] == amwoData$ID2[i-1] & amwoData$min.step[i] == 0 | is.na(amwoData$min.step[i]), 
+                                        amwoData$residency.length[i-1]+(amwoData$Ordinal[i]-amwoData$Ordinal[i-1]), 1)
+         
+}
+
+## Add a 'residency time' which is just the time spent within <1 minimum migratory step
+## from each stopover.  This is the maximum of residency.length for each unique stopover site
+## don't end up using but handy to retain
+
+## first count up number of distinct locations (sites >16.1 km)
+
+amwoData$unique.site[1]<- 1
+
+for (i in 2:nrow(amwoData)){
+  amwoData$unique.site[i]<- ifelse(amwoData$ID2[i] == amwoData$ID2[i-1] & amwoData$min.step[i] == 0 | is.na(amwoData$min.step[i]), 
+                                   amwoData$unique.site[i-1], 
+                                   ifelse(amwoData$ID2[i] == amwoData$ID2[i-1] & amwoData$min.step[i] == 1,
+                                                                     amwoData$unique.site[i-1]+ 1, 1))
+  
+}
+
+## next how many days are spent at each unique site. 
+
+amwoData$residency.time[1]<- 1
+
+Res.time<- amwoData %>%
+  group_by(ID2, unique.site) %>%
+  summarise(max = max(residency.length, na.rm=TRUE))
+
+## add ordinal date term 
+
+library(lubridate)
+amwoData$Ordinal<- yday(amwoData$date)
+
+## pull out into full length dataframe
+
+Res.time.df<- data.frame(ID2=amwoData$ID2, unique.site=amwoData$unique.site, Ordinal=amwoData$Ordinal, ID2=amwoData$ID2)
+
+Res.time.df2<- merge(Res.time.df, Res.time, by=c("ID2", "unique.site"))
+
+Res.time.df2$ID.site<- paste(Res.time.df2$ID2, Res.time.df2$unique.site, sep="-")
+
+## merge with amwoData
+
+amwoData$ID.site<- paste(amwoData$ID2, amwoData$unique.site, amwoData$Ordinal, sep="-")
+
+## sort by date
+
+amwoData <- amwoData[order(amwoData$ID2, amwoData$Ordinal),]
+Res.time.df2<- Res.time.df2[order(Res.time.df2$ID2, Res.time.df2$Ordinal),]
+
+#amwoData$residency.time<-Res.time.df2$max
+
+## assign a starting state for each individual to begin in state 1 
+## rank observations (requires correct sorting)
+
+library(dplyr)
+amwoData2<- amwoData %>%
+ group_by(ID) %>%
+  mutate(ranks = row_number())
+
+## ifelse to covert first observations to state 1 and all others NA
+
+knownStates<- ifelse(amwoData2$ranks == "1", 1, NA)
+
+##### Fit HMM
+
+##### 3-state model with fixed state transitions
+
+# label states and ceate distributions for movements
+stateNames <- c("pre","migration", "post")
+dist = list(step="gamma", angle="wrpcauchy")
+
+
+## fix step length parameters and state transitions
+
+fixPar.ord<- list(beta=matrix(c(NA, -100, # pre-migration to transitions, can't go pre- to post
+                     -100, NA,  #once entered migration can't go back to pre
+                     -100, -100, #once entred post-migration, can't leave
+                      NA, -100, # effect of date on pre-migration transition
+                     -100, NA, # effect of date on migration transition
+                     -100, -100), nrow=2, byrow=TRUE)) # residency time does not effect impossible post-migration transitions
+
+## just two data streams
+
+Par0_m1 <- list(step=c(0.485, 211.927, 0.485, #mean in km
+                       0.7327, 289.599, 0.7327, # SD in km
+                       0.026, 0.036, 0.026), #zeromass
+                angle=c(0, 0, 0, #mean
+                        0.5, 0.5, 0.5)) #sd
+
+
+## Ordinal date as covariate on transition probabilities and two data streams
+
+m1 <- fitHMM(data=amwoData, nbStates=3, dist=dist, Par0 = Par0_m1,
+             estAngleMean = list(angle=TRUE),
+             fixPar=fixPar.ord, 
+             formula = ~Ordinal ,
+             knownStates = knownStates,
+             stateNames = stateNames)
+m1
+
+#predict states for each point(predicted and observed) and input in the dataset
+## can then view amwoData to see state assigned to each location.
+
+states.m1 <- viterbi(m1)
+
+amwoData$states1 <- states.m1
+
+## look at individual birds if needed
+
+## export file if needed
+
+write.csv(amwoData, 'HMMmale.csv')
+
+### Post-Hmm state assignment data management
+
+## with 2022 addition, there is one bird (NC-2022-33-2022) who establishes residency in southern Maine but a mid-spring ranging movement
+## precludes state 3 assignment.  Reclassify all points for that bird after 3/19 to state 3
+
+utils::View(amwoData)
+
+amwoData$states1[2908:2939]<- 3
+
+#check
+
+amwoData[2908:2939,]
+
+## loop through ordinal date and delineate the midpoint
+## for each date gap
+
+## first the midpoint between i and i+1, which gives departure date
+
+amwoData$Mid.leave<- NA
+
+for (i in 1:nrow(amwoData)){
+  
+  amwoData$Mid.leave[i]<- ifelse(amwoData$ID[i]==amwoData$ID[i+1], 
+                               (amwoData$Ordinal[i+1]+amwoData$Ordinal[i])/2,
+                               NA)
+  
+}
+
+## next the midpoint between i and i-1, which gives the midpoint for arrival 
+
+amwoData$Mid.arrive<- NA
+
+for (i in 2:nrow(amwoData)){
+  
+  amwoData$Mid.arrive[i]<- ifelse(amwoData$ID[i]==amwoData$ID[i-1], 
+                                 (amwoData$Ordinal[i-1]+amwoData$Ordinal[i])/2,
+                                 NA)
+  
+}
+
+## Define the state transition points for initiation and termination for model 1
+
+amwoData$Initiate<- NA
+
+amwoData$Initiate[1]<- 0
+
+for (i in 2:nrow(amwoData)){
+  
+  amwoData$Initiate[i]<- ifelse(amwoData$states1[i]==2 & amwoData$states1[i-1]==1, 
+                                 1,0)      
+}
+
+
+## termination model 1
+
+amwoData$Terminate<- NA
+
+amwoData$Terminate[1]<- 0
+
+for (i in 2:nrow(amwoData)){
+  
+  amwoData$Terminate[i]<- ifelse(amwoData$states1[i]==3 & amwoData$states1[i-1]==2, 
+                                1,0)      
+}
+
+
+## calculate the mean precision of locations as the distance between the mid-point
+## and the actual location date.
+
+amwoData$precision<- amwoData$Ordinal-amwoData$Mid.arrive
+
+mean(amwoData$precision, na.rm=TRUE)#1.33
+sd(amwoData$precision, na.rm=TRUE)#1.317
+min(amwoData$precision, na.rm=TRUE)#0.5
+max(amwoData$precision, na.rm=TRUE)#23.5
+quantile(amwoData$precision, probs=c(seq(0,1,.05)), na.rm=TRUE)
+# 95% of data 3.5 days or less.
+
+
+
+## termination model 1 for birds monitored until June only
+## this is to get around the issue of dead migrants being tossed 
+## into the termination state
+
+## difference between initiation dates of birds that survive past June 1 vs those that do not
+
+## remove birds with no locations past May 20
+
+amwoData$max.date<- ifelse(amwoData$Ordinal>140, 1,0)
+
+amwoData.june<-amwoData[(amwoData$ID %in% amwoData$ID [amwoData$max.date == 1]) , ]
+
+
+amwoData.june$ID<-droplevels(amwoData.june$ID)
+
+length(levels(amwoData.june$ID)) #sample size (77 individuals)
+
+##June subset of termination points
+amwo.Terminate.june.all<- subset(amwoData.june, amwoData.june$states1==3)
+write.csv(amwo.Terminate.june.all, "Male_Post_Mig.csv")
+
+amwo.Terminate.june<- subset(amwoData.june, amwoData.june$states1==3 & amwoData.june$Terminate==1)
+
+summary(as.factor(amwo.Terminate.june$age)) # 30 Adult, 44 Juv
+
+write.csv(amwo.Terminate.june, "C:/Users/Erik/Desktop/R/terminate.csv")
+
+##all data
+
+amwo.Terminate<- subset(amwoData, amwoData$states1==3 & amwoData$Terminate==1)
+nrow(amwo.Terminate) #sample size (locations) #104
+
+amwo.Terminate$ID<-droplevels(amwo.Terminate$ID)
+
+length(levels(amwo.Terminate$ID)) #sample size (individuals)
+
+
+## extract all state 2 locations that are not initiation points
+
+amwo.Migrate<- subset(amwoData, amwoData$states1==2 & amwoData$Initiate==0)
+nrow(amwo.Migrate) #sample size (locations)
+
+amwo.Migrate$ID<-droplevels(amwo.Migrate$ID)
+
+length(levels(amwo.Migrate$ID)) #sample size (individuals) 127
+
+## extract initiation points
+
+amwo.Initiate<- subset(amwoData, amwoData$states1==2 & amwoData$Initiate==1) # 133 initiaton points
+nrow(amwo.Initiate) #sample size (locations)
+
+
+amwo.Initiate$ID<-droplevels(amwo.Initiate$ID) # 133 initiation points
+
+length(levels(amwo.Initiate$ID)) #sample size (individuals)
+ 
+summary(as.factor(amwo.Initiate$age)) #59 adults, 73 Juveniles, 1 unknown
+
+#### Migration (stopover) timing.  These are based on the actual 
+#### measured days
+
+## convert back to day of year
+
+amwo.Migrate$Day<- day(amwo.Migrate$date)
+amwo.Migrate$Month<- month(amwo.Migrate$date)
+head(amwo.Migrate$Month)
+
+amwo.Migrate$MonthDay<- as.Date(paste(amwo.Migrate$Month, 
+                                      amwo.Migrate$Day, sep="/"),
+                                "%m/%d")
+
+
+# sample size
+
+nrow(amwo.Migrate) #1914 locations
+
+
+## extract initiation points
+
+amwo.Initiate.june<- subset(amwoData.june, amwoData.june$states1==2 & amwoData.june$Initiate==1)
+nrow(amwo.Initiate.june) #sample size (locations) 77
+
+amwo.Initiate.june$ID<-droplevels(amwo.Initiate.june$ID)
+
+length(levels(amwo.Initiate.june$ID)) #sample size (individuals) 77
+
+amwo.Initiate$max.date<- NA
+
+## export initiation points to get capture locations
+
+write.csv(amwo.Initiate, 'initiate.csv')
+
+## import initiation points with capture locations
+
+Cap<- read.csv('EWMRCCAP.csv')
+Cap$number<- rep(1, times=nrow(Cap))
+
+cap.lat<- data.frame(aggregate(Cap$capLoc~Cap$caplat, FUN="min"))
+cap.long<- data.frame(aggregate(Cap$capLoc~Cap$caplon, FUN="min"))
+cap.ct<- Cap %>% count(capLoc)
+
+cap.lat<- cap.lat[order(cap.lat$Cap.capLoc),]
+cap.long<- cap.long[order(cap.long$Cap.capLoc),]
+
+Cap.all<- data.frame(CapLoc=cap.lat$Cap.capLoc,Lat=cap.lat$Cap.caplat, Long=cap.long$Cap.caplon, NCap=cap.ct$n)
+
+
+
+
+
+### OK, lets intersect the location data with the shapefile for the AMWO 
+### SGS coverage zones
+
+library(sf)
+library(spData)
+
+## move lat lon to first columns
+
+
+amwoData <- amwoData %>%
+  select(lon, lat, everything())
+
+## import SGS coverage polygons
+
+SGS <- st_read("G:/My Drive/Dropbox/Reasearch/Woodcock/Migraton Project/Movement Modls/sgs_survey_window_polygons/sgs_survey_window_polygons.shp")
+
+SGS$id<-as.factor(SGS$id)
+SGS <- st_transform(SGS, crs = 3857)
+
+
+## pointsDF: A data.frame whose first column contains longitudes and
+##           whose second column contains latitudes.
+##
+## states:   An sf MULTIPOLYGON object with 50 states plus DC.
+##
+## name_col: Name of a column in `states` that supplies the states'
+##           names.
+
+lonlat_to_state <- function(amwoData,
+                            states = SGS,
+                            name_col = "id") {
+  ## Convert points data.frame to an sf POINTS object
+  pts <- st_as_sf(amwoData, coords = 1:2, crs = 4326)
+  
+  ## Transform spatial data to some planar coordinate system
+  ## (e.g. Web Mercator) as required for geometric operations
+  states <- st_transform(states, crs = 3857)
+  pts <- st_transform(pts, crs = 3857)
+  
+  ## Find names of state (if any) intersected by each point
+  state_names <- states[[name_col]]
+  ii <- as.integer(st_intersects(pts, states))
+  state_names[ii]
+}
+
+aab <- lonlat_to_state(amwoData)
+
+amwoData$SGSZone <- aab
+
+## repeat for birds monitored into June
+## move lat lon to first columns
+
+amwoData.june <- amwoData.june %>%
+  select(lon, lat, everything())
+
+
+amwoData.june$SGSZone <- lonlat_to_state(amwoData.june)
+
+## need to fix 'Zone 5' to only reflect points >36.541253 latitude
+
+amwoData$SGSZone2<- amwoData$SGSZone
+
+for (i in 1:nrow(amwoData)){
+  amwoData$SGSZone[i]<- ifelse(amwoData$SGSZone2[i]=="5" & amwoData$lat[i]<36.541253, "NA", amwoData$SGSZone2[i])
+}
+
+## June birds
+
+amwoData.june$SGSZone2<- amwoData.june$SGSZone
+
+for (i in 1:nrow(amwoData.june)){
+  amwoData.june$SGSZone[i]<- ifelse(amwoData.june$SGSZone2[i]=="5" & amwoData.june$lat[i]<36.541253, "NA", amwoData.june$SGSZone2[i])
+}
+
+
+
+## extract migration points by SGS zone 
+## note shapefile labels for zones (1:5) are opposite USFWS designators for zones.  This is fixed later in labelling
+
+z1.migrate<- subset(amwoData, amwoData$SGSZone == "1" & amwoData$states1=="2" & amwoData$Initiate=="0")
+z2.migrate<- subset(amwoData, amwoData$SGSZone == "2" & amwoData$states1=="2" & amwoData$Initiate=="0")
+z3.migrate<- subset(amwoData, amwoData$SGSZone == "3" & amwoData$states1=="2" & amwoData$Initiate=="0")
+z4.migrate<- subset(amwoData, amwoData$SGSZone == "4" & amwoData$states1=="2" & amwoData$Initiate=="0")
+z5.migrate<- subset(amwoData, amwoData$SGSZone == "5" & amwoData$states1=="2" & amwoData$Initiate=="0")
+
+## calculate 'survey day' by subtracting start date of SGS for each zone from the ordinal day
+
+z1.migrate$SGSDay<- z1.migrate$Mid.leave-121 #May 1
+z2.migrate$SGSDay<- z2.migrate$Mid.leave-115 #April 25
+z3.migrate$SGSDay<- z3.migrate$Mid.leave-110 #April 20
+z4.migrate$SGSDay<- z4.migrate$Mid.leave-105 #April 15
+z5.migrate$SGSDay<- z5.migrate$Mid.leave-100 #April 10
+
+## recombine for graphing
+
+amwo.Migrate.SGS.z<- rbind(z1.migrate, z2.migrate, z3.migrate, z4.migrate, z5.migrate)
+
+SGS.Mig.plot.z<- ggplot(amwo.Migrate.SGS.z, aes(x=SGSZone, y=SGSDay, fill=SGSZone))+
+  annotate("rect", xmin = .5, xmax = 5.5, ymin = 0, ymax = 20,
+           alpha = .8, fill = "gray", color="black")+
+  annotate("text", x=1, y=10, label= "Survey\nwindow") + 
+ annotate("text", x=1, y=40, label= "Migration", fontface="bold", size=4) + 
+  
+  geom_boxplot(outlier.shape = NA)+
+  geom_point(color ="black" , shape = 21,  
+             position = position_jitterdodge(dodge.width = 0, jitter.width = 1), size = 2.5, alpha = 0.9) +
+  coord_flip()+
+  ylab("")+
+ ylim(-100,50)+
+  xlab("SGS zone")+
+  scale_x_discrete(labels=c("5", "4", "3", "2", "1"),
+                  limits=c("5", "4", "3", "2", "1"), 
+                  breaks=c("1", "2", "3", "4", "5"))+
+  scale_fill_manual(name="",
+                    guide = "none",
+                    breaks=c("1", "2", "3", "4", "5"),
+                    labels=c("1", "2", "3", "4", "5"),
+                    values=c("#E69F00", "#009e73",  "#0072B2", "#D55E00","#F0E442")) +
+  theme_classic(base_size = 14)
+
+SGS.Mig.plot.z
+
+## extract only points past the SGS zone start and look at which males are involved
+
+#zone 1
+
+## total males migrating in zone 1
+
+z1.males<- levels(droplevels(z1.migrate$ID))
+length(z1.males) #39
+
+## those migrating after the May 1 start date
+
+z1.m.over<- subset(z1.migrate, z1.migrate$SGSDay>-1)
+z1.over.males<- levels(droplevels(z1.m.over$ID))
+z1.over.males # 14
+
+14/39 #0.3589
+
+#zone 2
+
+z2.males<- levels(droplevels(z2.migrate$ID))
+z2.males #50
+
+z2.m.over<- subset(z2.migrate, z2.migrate$SGSDay>-1)
+z2.over.males<- levels(droplevels(z2.m.over$ID))
+z2.over.males #9
+9/50 #0.18
+
+#zone 3
+
+z3.males<- levels(droplevels(z3.migrate$ID))
+z3.males #60
+
+z3.m.over<- subset(z3.migrate, z3.migrate$SGSDay>-1)
+z3.over.males<- levels(droplevels(z3.m.over$ID))
+z3.over.males #6
+
+6/60 # 0.10
+
+#zone 4
+
+z4.males<- levels(droplevels(z4.migrate$ID))
+z4.males #80
+
+z4.m.over<- subset(z4.migrate, z4.migrate$SGSDay>-1)
+z4.over.males<- levels(droplevels(z4.m.over$ID))
+z4.over.males #7
+
+7/80 #0.0875
+
+#zone 5
+
+z5.males<- levels(droplevels(z5.migrate$ID))
+z5.males #63
+
+z5.m.over<- subset(z5.migrate, z5.migrate$SGSDay>-1)
+z5.over.males<- levels(droplevels(z5.m.over$ID))
+z5.over.males #3
+
+3/66 # 0.04545
+
+## overall plot of termination points by SGS zone
+
+amwo.Terminate.SGS<- subset(amwoData.june, amwoData.june$states1=="3" & amwoData.june$Terminate=="1")
+
+## remove FL and Newfoundland outlier birds which are outside SGS zones
+
+amwo.Terminate.SGS<- subset(amwo.Terminate.SGS, amwo.Terminate.SGS$ID!="FL-2021-01-2021")
+amwo.Terminate.SGS<- subset(amwo.Terminate.SGS, amwo.Terminate.SGS$ID!="NJ-2019-18-2020")
+
+
+## figure out which males logged overshot migration points in zones they did not settle in
+
+## remove males from termination data that were migrating in each zone
+
+################# Needs to be double checked #################################
+ 
+
+mig.term.over.1 <- amwo.Terminate.SGS %>% filter((ID %in% z1.over.males))
+mig.term.over.1 #11 males, 1 settled in zone 2. 10 in zone 1
+
+mig.term.over.2 <- amwo.Terminate.SGS %>% filter((ID %in% z2.over.males))
+mig.term.over.2 #7 males, 2 settled in zone 2, 5 in zone 1.
+
+mig.term.over.3 <- amwo.Terminate.SGS %>% filter((ID %in% z3.over.males))
+mig.term.over.3 #4 males, 1 each in zones 4, 3, and two in 1
+
+mig.term.over.4 <- amwo.Terminate.SGS %>% filter((ID %in% z4.over.males))
+mig.term.over.4 #7 males, 3 in zone 1, 2 in 2, 1 each in 3 and 4
+
+mig.term.over.5 <- amwo.Terminate.SGS %>% filter((ID %in% z5.over.males))
+mig.term.over.5 #3 males, 2 in zone 1 and 1 in zone 2
+
+
+#total migrating during active window
+
+11+7+4+7+3 #32
+
+## total settling in the same zone
+
+10+2+1+1 #14
+
+14/32  #44%
+
+## extract termination points by SGS zone
+
+z1.terminate<- subset(amwo.Terminate.SGS, amwo.Terminate.SGS$SGSZone == "1" & amwo.Terminate.SGS$states1=="3" )
+z2.terminate<- subset(amwo.Terminate.SGS, amwo.Terminate.SGS$SGSZone == "2" & amwo.Terminate.SGS$states1=="3")
+z3.terminate<- subset(amwo.Terminate.SGS, amwo.Terminate.SGS$SGSZone == "3" & amwo.Terminate.SGS$states1=="3" )
+z4.terminate<- subset(amwo.Terminate.SGS, amwo.Terminate.SGS$SGSZone == "4" & amwo.Terminate.SGS$states1=="3")
+z5.terminate<- subset(amwo.Terminate.SGS, amwo.Terminate.SGS$SGSZone == "5" & amwo.Terminate.SGS$states1=="3" )
+
+## calculate 'survey day' by subtracting start date of SGS for each zone from the arrival day
+
+z1.terminate$SGSDay<- z1.terminate$Mid.arrive-121 #May 1
+z2.terminate$SGSDay<- z2.terminate$Mid.arrive-115 #April 25
+z3.terminate$SGSDay<- z3.terminate$Mid.arrive-110 #April 20
+z4.terminate$SGSDay<- z4.terminate$Mid.arrive-105 #April 15
+z5.terminate$SGSDay<- z5.terminate$Mid.arrive-100 #April 10
+
+
+## for zone 5, how many birds during the active window and following
+z1.duringafter<- subset(z1.terminate, z1.terminate$SGSDay>=0)
+z1.after<- subset(z1.terminate, z1.terminate$SGSDay>=21)
+nrow(z1.duringafter) #15
+nrow(z1.after) #2
+nrow(z1.terminate) #38
+
+2/38
+15/38 #0.3947
+
+
+## recombine for graphing
+
+amwo.Terminate.SGS.z<- rbind(z1.terminate, z2.terminate, z3.terminate, z4.terminate, z5.terminate)
+
+SGS.Term.plot.z<- ggplot(amwo.Terminate.SGS.z, aes(x=SGSZone, y=SGSDay, fill=SGSZone))+
+  annotate("rect", xmin = .5, xmax = 5.5, ymin = 0, ymax = 20,
+           alpha = .8, fill = "gray", color="black")+
+  annotate("text", x=1, y=10, label= "Survey\nwindow") + 
+  annotate("text", x=1, y=40, label= "Termination", fontface="bold", size=4) + 
+  geom_boxplot(outlier.shape = NA)+
+  geom_point(color ="black" , shape = 21,  
+             position = position_jitterdodge(dodge.width = 0, jitter.width = 1), size = 3, alpha = 0.9) +
+  coord_flip()+
+  ylim(-100,50)+
+  ylab("Days prior to SGS start")+
+  xlab("SGS zone")+
+  scale_x_discrete(labels=c("5", "4", "3", "2", "1"),
+                   limits=c("5", "4", "3", "2", "1"), 
+                   breaks=c("1", "2", "3", "4", "5"))+
+  scale_fill_manual(name="",
+                    guide = "none",
+                    breaks=c("1", "2", "3", "4", "5"),
+                    labels=c("1", "2", "3", "4", "5"),
+                    values=c("#E69F00", "#009e73",  "#0072B2", "#D55E00","#F0E442")) +
+  theme_classic(base_size = 14)
+
+
+SGS.Term.plot.z
+
+install.packages("cowplot")
+
+library(cowplot)
+
+
+chronplot<-plot_grid(SGS.Mig.plot.z, SGS.Term.plot.z,
+                     ncol=1
+)
+
+chronplot
+
+library(ggplot2)
+
+ggsave("Figure3.jpeg", device="jpeg",
+       scale = 1, width = 8, height = 8, units = c("in"),
+       dpi = 600, limitsize = TRUE)
+
+
+
+## SEQUENCE OF PLOTS DEMONSTRATING PHENOLOGY BY YEAR
+
+## plot termination date by latitude
+
+library(lubridate)
+
+amwo.Terminate.SGS.z$date2<- as.POSIXct(amwo.Terminate.SGS.z$date,
+           tryFormats = c("%Y-%m-%d"))
+
+amwo.Terminate.SGS.z$monthday<- #mdy(amwo.Terminate.SGS.z$date2)
+  strftime(amwo.Terminate.SGS.z$date, format="%m-%d")
+
+term.lat.plot<- ggplot(amwo.Terminate.SGS.z, aes(x=lat, y=Mid.arrive, fill=as.factor(year)))+
+  geom_point(color ="black", shape = 21, size = 4, alpha=.6) +
+  ylab("Date of termination")+
+  xlab("Latitude")+
+  scale_fill_manual(name="Year",
+                    breaks=c("2019", "2020", "2021", "2022"),
+                    labels=c("2019", "2020", "2021", "2022"),
+                    values=c("gray13", "darkgoldenrod3", "burlywood1", "ivory"))+
+  theme_classic(base_size = 14)+
+  theme(axis.text.y=element_text(margin = margin(6, unit = "cm")),
+        legend.position = 'none')
+
+term.lat.plot
+
+## termination relative to SGS timing by year 
+
+19/72 # 26.3% of birds terminate during or after an active window
+
+
+
+term.SGS.plot<- ggplot(amwo.Terminate.SGS.z, aes(x=year, y=SGSDay, fill=as.factor(year)))+
+  geom_boxplot(outlier.shape = NA, alpha=.8)+
+  geom_point(color ="black", shape = 21,
+             position = position_jitterdodge(dodge.width = 0, jitter.width = 1), size = 3, alpha = 0.6) +
+  ylab("Days relative to SGS")+
+  xlab("Year")+
+  scale_fill_manual(name="Year",
+                    breaks=c("2019", "2020", "2021", "2022"),
+                    labels=c("2019", "2020", "2021", "2022"),
+                    values=c("gray13", "darkgoldenrod3", "burlywood1", "ivory"))+
+  theme_classic(base_size = 14)+
+  theme(axis.text.y=element_text(margin = margin(6, unit = "cm")),
+        legend.position = 'none')
+
+term.SGS.plot
+
+## initiation
+
+init.lat.plot<- ggplot(amwo.Initiate, aes(x=lat, y=Ordinal, fill=as.factor(year)))+
+  geom_point(color ="black", shape = 21, size = 4) +
+  ylab("Date of initiation")+
+  xlab("Wintering latitude")+
+  scale_fill_manual(name="Year",
+                    breaks=c("2019", "2020", "2021", "2022"),
+                    labels=c("2019", "2020", "2021", "2022"),
+                    values=c("gray13", "darkgoldenrod3", "burlywood1", "ivory"))+
+  theme_classic(base_size = 14)+
+  theme(axis.text.y=element_text(margin = margin(6, unit = "cm")),
+        legend.position = 'none')
+
+init.lat.plot
+
+### Generic plots to show how timing of initiation and termination varies among years
+#install.packages("ggridges")
+library(ggridges)
+
+amwo.Initiate$Type<- rep(c("Initiation"), times=nrow(amwo.Initiate))
+amwo.Terminate.june$Type<- rep(c("Termination"), times=nrow(amwo.Terminate.june))
+amwo.Migrate2<-amwo.Migrate[,1:34]
+amwo.Migrate2$Type<- rep(c("Migration"), times=nrow(amwo.Migrate))
+
+
+
+amwo.chronology<- rbind(amwo.Initiate, amwo.Terminate.june, amwo.Migrate2)
+amwo.chronology$TypeYear<- paste(amwo.chronology$Type, amwo.chronology$year, sep="-")
+
+## ggridges option
+
+Year.Initiate<- ggplot(amwo.chronology, aes(x=Mid.leave, fill=as.factor(year)))+
+  geom_density_ridges(aes(y=TypeYear, linetype=Type), alpha=0.6, size=1, scale=1.5)+
+  xlab("Day of year")+
+  ylab("")+
+  scale_y_discrete(labels=c("", "","Termination", "",
+                            "","","Migration", "",
+                            "", "", "Initiation", ""),
+    expand = expansion(mult = c(0.01, 0.25)), limits=rev) +
+  scale_fill_manual(name="Year",
+                  breaks=c("2019", "2020", "2021", "2022"),
+                  labels=c("2019", "2020", "2021", "2022"),
+                  values=c("gray13", "darkgoldenrod3", "burlywood1", "ivory"))+
+ guides(linetype="none")+
+    theme_classic(base_size = 16)+
+  theme(legend.position = "bottom",
+        axis.text.y = element_text(angle = 45))
+
+Year.Initiate
+
+
+## dual side-by plot
+
+right.row<-plot_grid(term.lat.plot, term.SGS.plot,
+                    labels = c("B", "C"), 
+                    label_size=12,
+                    ncol=1
+                    )
+chronology.grid<-plot_grid(Year.Initiate, right.row,
+                           labels = c("A", "", ""), 
+                           label_size=12,
+                           ncol=2,
+                           rel_widths=c(2,1.2)
+)
+
+
+chronology.grid
+
+ggsave("Figure7.jpeg", device="jpeg",
+       scale = 1, width = 10, height = 8, units = c("in"),
+       dpi = 600, limitsize = TRUE)
+
+
+### some analyses to look at whether both termination date and zone overshoot 
+### are predictable
+
+term.df<- data.frame(amwo.Terminate.SGS.z)
+init.df<- data.frame(amwo.Initiate)
+
+#merge together
+
+term.init<- merge(term.df, init.df, by="ID")
+
+## correlation matrix for variables, checking to see if I can run just one model
+
+cor.var<- data.frame(term.init$lon.x, term.init$lat.x,
+                     term.init$lon.y,
+                     term.init$lat.y)
+
+
+cor(cor.var)
+
+## initiation lat/lon are highly correlated r=0.7
+## single variable GLMs
+
+init.lat.lm<- lm(data=term.init, 
+                   term.init$Mid.arrive.x~term.init$age.x+term.init$year.x+term.init$lat.y)
+
+summary(init.lat.lm)
+
+init.lon.lm<- lm(data=term.init, 
+                   term.init$Mid.arrive.x~term.init$age.x+term.init$year.x+term.init$lon.y)
+
+init.lat.lon.lm<- lm(data=term.init, 
+                 term.init$Mid.arrive.x~term.init$age.x+term.init$year.x+term.init$lon.y+term.init$lat.y)
+
+
+summary(init.lon.lm)
+
+
+term.lon.lm<- lm(data=term.init, 
+                   term.init$Mid.arrive.x~term.init$age.x+term.init$year.x+term.init$lon.x)
+
+summary(term.lon.lm) #significant termination longitude effect (0.9253) 
+
+term.lat.lm<- lm(data=term.init, 
+                   term.init$Mid.arrive.x~term.init$age.x+term.init$year.x+term.init$lat.x)
+
+summary(term.lat.lm) #significant lattitude effect (5.9271)
+
+term.lat.lon.lm<- lm(data=term.init, 
+                 term.init$Mid.arrive.x~term.init$age.x+term.init$year.x+term.init$lat.x+term.init$lon.x)
+
+summary(term.lat.lon.lm) # longitude effect goes away when included with lat
+
+
+
+term.lm<- lm(data=term.init, 
+                 term.init$Mid.arrive.x~term.init$age.x+term.init$year.x)
+
+summary(term.lm)
+
+## table of coefficients (ie table 1)
+
+#install.packages("sjPlot")
+library(sjPlot)
+
+
+tab_model(init.lat.lon.lm)
+
+
+
+### Mapping code 
+library(sf)
+library(spData)
+library(rgdal)
+library(dplyr)
+library(raster)
+library(ggspatial)
+library(tidyverse)
+library(ggplot2)
+##municipal boundaries for US, Canada, and Great Lakes
+
+can <- st_read("G:/My Drive/Dropbox/Reasearch/Woodcock/Migraton Project/Movement Modls/Canada.shp")
+us <- st_read("G:/My Drive/Dropbox/Reasearch/Woodcock/Migraton Project/Movement Modls/tl_2018_us_state.shp")
+gl <- st_read("G:/My Drive/Dropbox/Reasearch/Woodcock/Migraton Project/Movement Modls/Great_Lakes.shp")
+
+## singing ground survey zone lines
+
+SGSLine <- st_read("G:/My Drive/Dropbox/Reasearch/Woodcock/Migraton Project/Movement Modls/SGS Analysis/Latitude Lines.shp")
+
+## singing ground survey coverage
+
+SGSCov <- st_read("G:/My Drive/Dropbox/Reasearch/Woodcock/Migraton Project/Movement Modls/SGS Analysis/sgs_extent_mooreetal2019.shp")
+
+#state in focal 'eastern USA/CANANDA"
+us2 <- us %>%
+  dplyr::filter(STUSPS %in% c("ME", "VT", "RI", "PA", "NY", "NJ", "DC", "NH", "VT", "CT",
+                              "MD", "VA", "WV", "NC", "SC", "GA", "FL", "MA", "DE"))
+
+#states in woodcock range
+
+us4 <- us %>%
+  dplyr::filter(STUSPS %in% c("ME", "VT", "NH", "MA", "RI", "PA", "NY", "NJ", "DC", "CT", 
+                              "MD", "VA", "WV", "DE", "NC", "SC", "GA", "AL", "FL", "TN",
+                              "KY", "MS", "LA", "TX", "OK", "AR", "MO", "OH", "IN", "IL",
+                              "IA", "MN", "MI", "WI", "KS", "ND", "SD", "NE")) 
+
+#states in focal area for this project
+
+us4.1 <- us %>%
+  dplyr::filter(STUSPS %in% c("ME", "VT", "NH", "MA", "RI", "PA", "NY", "NJ", "DC", "CT", 
+                              "MD", "VA", "WV", "DE", "NC", "SC", "GA", "AL", "FL", "TN",
+                              "KY", "MS", "LA", "AR", "MO", "OH", "IN", "IL",
+                              "IA", "MN", "MI", "WI")) 
+
+
+
+#central management region
+
+us5 <- us %>%
+  dplyr::filter(STUSPS %in% c("ME", "VT", "NH", "MA", "RI", "PA", "NY", "NJ", "DC", "CT", 
+                              "MD", "VA", "WV", "DE", "NC", "SC", "GA", "AL", "FL", "TN",
+                              "KY", "MS", "LA", "AR", "MO", "OH", "IN", "IL",
+                              "IA", "MN", "MI", "WI")) 
+
+# provinces in AMWO eastern Range
+can2 <- can %>%
+  dplyr::filter(NAME %in% c("Quebec", "New Brunswick", "Nova Scotia", "Prince Edward Island",
+                            "Newfoundland and Labrador"))
+# provinces in AMWO breeding range
+can4 <- can %>%
+  dplyr::filter(NAME %in% c("Ontario", "Quebec", "New Brunswick", "Nova Scotia", "Prince Edward Island",
+                            "Newfoundland and Labrador", "Manitoba"))
+
+# provinces in focal area for this analysis
+can4.1 <- can %>%
+  dplyr::filter(NAME %in% c("Ontario", "Manitoba"))
+
+## distribution of start and end points
+
+## merge start and end points
+
+start.end<- rbind(amwo.Terminate.june, amwo.Initiate)
+
+Cap.all$NCap2<- Cap.all$NCap
+
+Initiate.plot<- ggplot() +
+  geom_sf(data=us4, fill="white", color= "grey45", size=.5) +  
+  geom_sf(data=can4, fill="white", color= "grey45") +
+  geom_sf(data=us4.1, fill="gray95", color= "grey45", size=.5) +  
+  geom_sf(data=us2, fill="darkgray", color= "grey45") +
+  geom_sf(data=can4.1, fill="gray95", color= "grey45") +
+  geom_sf(data=can2, fill="darkgray", color= "grey45") +
+  geom_sf(data=gl, fill="grey45", color= "grey45") +
+  geom_sf(data=SGSLine, color="Black", size=1.15) +
+  annotate("segment", x =-95.7, xend = -92.1, y = 40.6, yend = 40.6,
+           color="Black", size=1.15)+
+  annotate("segment", x =-95, xend = -91, y = 39, yend = 39,
+           color="Black", size=1.15)+
+  annotate("segment", x =-95, xend = -75, y = 36.541253, yend = 36.541253,
+           color="Black", size=1.15)+
+  annotate("text", x=-94.6, y=47.5, label= "5", size=10, fontface="bold", color="#E69F00") + 
+  annotate("text", x=-94.2, y=44.8, label= "4", size=10, fontface="bold", color="#009e73") + 
+  annotate("text", x=-93.8, y=42.2, label= "3", size=10, fontface="bold", color="#0072B2") + 
+  annotate("text", x=-93.4, y=39.9, label= "2", size=10, fontface="bold", color="#D55E00") + 
+  annotate("text", x=-93, y=37.8, label= "1", size=10, fontface="bold", color="#F0E442") + 
+  
+  annotation_scale(location = "bl", width_hint = 0.75, text_cex=1.5) +
+   annotation_north_arrow(location = "tr", which_north = "true", 
+                         pad_x = unit(0.1, "in"), pad_y = unit(6.5, "in"),
+                        style = north_arrow_fancy_orienteering) +
+  
+  xlab("") +
+  ylab("") +
+  labs(size="Number of males captured", size=16, fontface="bold")+
+  ylim(ymin=24, ymax=52)+
+  xlim(Xmin=-97, ymax=-53)+
+  theme_classic(base_size = 16) +
+  geom_point(data=Cap.all, aes(x = Long, y = Lat, size=NCap),
+            color="black", fill="steelblue4", shape=21, alpha=.7) +
+  #  scale_shape_manual(values=c(21, 22))+
+#  scale_fill_manual(values=c("darkorange2","steelblue6"))+
+  annotate("rect", xmin =-71.5, xmax = -69.5, ymin = 29.1, ymax = 30.1,
+           fill="darkgray", color= "grey45")+
+  annotate("rect", xmin =-71.5, xmax = -69.5, ymin = 27.6, ymax = 28.6,
+           fill="gray95", color= "grey45")+
+    annotate("text", x=-63.4, y=29.6, label= "Eastern Region", size=6.5, fontface="bold", color="Black") +
+  annotate("text", x=-63.4, y=28.1, label= "Central Region", size=6.5, fontface="bold", color="Black") +
+  #  annotate("text", x=65.4, y=28.1, label= "Central Region", size=6.5, fontface="bold", color="Black") +
+     theme(legend.position =  c(.75, .35),
+        legend.title = element_text(size = 18, face = "bold"), 
+        legend.text= element_text(size = 18, face = "bold"), 
+        panel.border =  element_rect(size = 0.5, fill=NA, linetype = "solid", colour = "black"))
+
+
+Initiate.plot
+
+
+ggsave("Figure1.jpeg", device="jpeg",
+       scale = 1, width = 10, height = 8, units = c("in"),
+       dpi = 600, limitsize = TRUE)
+
+## termination sites by SGS coverage
+## all termination points, not just SGS zone 
+
+Terminate.all<- subset(amwoData.june, amwoData.june$Terminate==1)
+nrow(Terminate.all)
+
+Terminate.plot<- ggplot() +
+  geom_sf(data=us4, fill="gray95", color= "grey45", size=.5) +  
+  geom_sf(data=can4, fill="gray95", color= "grey45") +
+  geom_sf(data=gl, fill="grey45", color= "grey45") +
+  geom_sf(data=SGSCov, color="Black", size=1.15, alpha=.5) +
+  annotation_scale(location = "bl", width_hint = 0.75, text_cex=1.5) +
+  annotation_north_arrow(location = "tr", which_north = "true", 
+                         pad_x = unit(0.1, "in"), pad_y = unit(4.5, "in"),
+                         style = north_arrow_fancy_orienteering) +
+  xlab("") +
+  ylab("") +
+  ylim(ymin=25, ymax=53)+
+  xlim(Xmin=-100, ymax=-53)+
+  theme_classic(base_size = 16) +
+  geom_point(data=start.end, aes(x = lon, y = lat, fill=Type, shape=Type),
+             color="black", size = 2.5, alpha=.7) +
+  scale_shape_manual(values=c(21, 22))+
+  scale_fill_manual(values=c("darkorange2","steelblue4"))+
+  
+  
+# geom_point(data=Terminate.all, aes(x = lon, y = lat),
+ #            color="black", size = 2.5, alpha=.7, fill="steelblue4", shape=22) +
+ theme(legend.position =  c(.8, .3),
+        legend.title = element_blank(), 
+        legend.text= element_text(size = 16, face = "bold"), 
+        panel.border =  element_rect(size = 0.5, fill=NA, linetype = "solid", colour = "black"))
+
+
+
+Terminate.plot
+
+ggsave("Figure2.jpeg", device="jpeg",
+       scale = 1, width = 10, height = 6, units = c("in"),
+       dpi = 600, limitsize = TRUE)
+
+## termination points by zone
+
+summary(as.factor(amwo.Terminate.SGS.z$SGSZone2))
+
+38+16+9+7+2 #72 males
+
+
+## males that overshoot and have migration points in an active survey zone
+
+#z5.overmales<- as.list()
+
+z5.overmales.data<- amwoData %>% filter((ID %in% z1.over.males))
+z5.terminate<- amwo.Terminate %>% filter((ID %in% z1.over.males))
+  
+z4.overmales.data<- amwoData %>% filter((ID %in% z2.over.males))
+z4.terminate<- amwo.Terminate.june %>% filter((ID %in% z2.over.males))
+
+
+z234.overmales.data<- amwoData %>% filter((ID %in% c(z2.over.males,z3.over.males, z4.over.males)))
+z234.terminate<- amwo.Terminate.june %>% filter((ID %in% c(z2.over.males,z3.over.males , z4.over.males)))
+
+## extract just points that are over the SGS start date and are either a termination date or a 
+## migration point
+
+## pull just the termination points that begin during or after an active window
+
+amwo.over.term<- subset(amwo.Terminate.SGS.z, amwo.Terminate.SGS.z$SGSDay>-.5)
+nrow(amwo.over.term) #19
+
+## pull migration points
+
+amwo.mig.term<- subset(amwo.Migrate.SGS.z, amwo.Migrate.SGS.z$SGSDay>-.5)
+nrow(amwo.mig.term)
+summary(as.factor(amwo.mig.term$SGSZone))
+
+## append together
+
+amwo.over.all<- rbind(amwo.over.term[,1:37], amwo.mig.term)
+
+## Add UTM Coordinates
+
+library(rgdal)
+library(sp)
+
+LatLong <- data.frame(lon=amwo.over.all$lon, lat=amwo.over.all$lat)
+
+# Convert it to a sp object
+coordinates(LatLong) <- ~ lon + lat # longitude first
+
+# Add a coordinate reference system
+proj4string(LatLong) <- CRS("+proj=longlat +ellps=WGS84 +datum=WGS84")
+
+
+# Project using spTransform
+Utm <- spTransform(LatLong, CRS("+proj=utm +zone=11 ellps=WGS84"))
+Utm@coords
+
+amwo.over.all$utm.x<- Utm@coords[,1]
+amwo.over.all$utm.y<- Utm@coords[,2]
+
+## distances by group?
+
+amwo.sub<- subset(amwo.over.all, amwo.over.all$ID=="NC-2021-25-2021")
+
+dist.test<- amwo.over.all %>% group_by(ID) %>%
+  mutate(Dist = colMeans(as.matrix(dist(cbind(utm.x, utm.y)))))
+
+## some summary stats for the mean distances between stopovers 
+## during an open SGS window and eventual settlement points
+
+dist.test.term<- subset(dist.test, dist.test$states1==3 & dist.test$Dist>0)
+nrow(dist.test.term)
+hist(dist.test.term$Dist, breaks=10)
+summary(dist.test.term$Dist)
+
+quantile(dist.test.term$Dist, probs=c(seq(0,1,.05)))
+dist.test.term$dist<- dist.test.term$Dist/1000
+dist.hist<- ggplot(dist.test.term, aes(x=dist)) +
+  geom_histogram(color='black', fill='dark gray', binwidth = 50)+
+ # geom_density(color='red', linetype=1, lwd=1.5,  alpha=.8)+
+  xlab("Step distance (km)")+
+  ylab("Frequency")+
+  theme_classic(base_size = 14)
+
+dist.hist
+
+## what's the average stopover duration for males at 
+## stopovers occupied during the active window
+
+amwo.mig.term$ID.site<- paste(amwo.mig.term$ID, amwo.mig.term$unique.site, sep="-")
+
+sgs.over.stop<- aggregate(amwo.mig.term$residency.length~amwo.mig.term$ID.site, FUN="max")
+
+
+nrow(sgs.over.stop)
+summary(sgs.over.stop$`amwo.mig.term$residency.length`)
+
+quantile(sgs.over.stop$`amwo.mig.term$residency.length`, probs=c(seq(0,1,.05)))
+
+singld.day.stop<- subset(sgs.over.stop, sgs.over.stop$`amwo.mig.term$residency.length`<1.1)
+
+## for context, what do all stopovers look like
+
+## extract all stopover points
+
+amwo.Migrate$ID.site<- paste(amwo.Migrate$ID, amwo.Migrate$unique.site, sep="-")
+
+all.stop<- aggregate(amwo.Migrate$residency.length~amwo.Migrate$ID.site, FUN="max")
+View(all.stop)
+
+nrow(all.stop)
+hist(all.stop$`amwo.Migrate$residency.length`)
+summary(all.stop$`amwo.Migrate$residency.length`)
+quantile(all.stop$`amwo.Migrate$residency.length`, probs=c(seq(0,1,.05)))
+
+
+stop.hist<- ggplot(all.stop, aes(x=`amwo.Migrate$residency.length`)) +
+  geom_histogram(data=sgs.over.stop, aes(x=`amwo.mig.term$residency.length`, y = ..density..),
+                 color='black', fill='dark gray', binwidth=4)+
+  geom_density(color='red', linetype=1, lwd=1.5,  alpha=.8)+
+  xlab("Stopover duration (days)")+
+  ylab("Proportion of stops")+
+  theme_classic(base_size = 14)
+
+stop.hist
+
+library(cowplot)
+hist.grid<-plot_grid(
+                dist.hist, stop.hist,
+                labels = c('A', 'B'), 
+                     label_size=15,
+                      ncol=2, heights=2,2)
+
+test.grid<- plot_grid(dist.hist, stop.hist)
+
+hist.grid
+
+library(ggplot2)
+
+ggsave("Figure6.jpeg", device="jpeg",
+       scale = 1, width = 8, height = 4, units = c("in"),
+       dpi = 600, limitsize = TRUE)
+
+
+
+
+## Map showing distribution of stopover points recorded during SGS windows
+
+amwo.mig.term<- subset(amwo.over.all, amwo.over.all$Terminate==0)
+stop.term.comp<- rbind(amwo.mig.term[,1:36], amwo.Terminate.SGS.z[,1:36])
+
+stop.term.comp$Category<- c(rep("Stopover", nrow(amwo.mig.term)), 
+                            rep("Termination", nrow(amwo.Terminate.SGS.z)))
+
+
+library(sp)
+library(ggspatial)
+
+## export so I don't have to run the whole thing again to remake this figure
+
+setwd("C:/Users/Erik/Desktop/R")
+
+write.csv(stop.term.comp, "Figure5data1.csv")
+
+fig5<- read.csv("Figure5data1.csv")
+
+Stop.plot<- ggplot() +
+  geom_sf(data=us4, fill="gray95", color= "grey45", size=.5) +  
+  geom_sf(data=can4, fill="gray95", color= "grey45") +
+  geom_sf(data=gl, fill="grey45", color= "grey45") +
+  geom_sf(data=SGSLine, color="Black", size=1.15) +
+  annotate("segment", x =-95.7, xend = -92.1, y = 40.6, yend = 40.6,
+           color="Black", size=1.15)+
+  annotate("segment", x =-95, xend = -91, y = 39, yend = 39,
+           color="Black", size=1.15)+
+  annotate("segment", x =-95, xend = -75, y = 36.541253, yend = 36.541253,
+           color="Black", size=1.15)+
+  annotate("text", x=-94.6, y=47.5, label= "5", size=6, fontface="bold", color="#E69F00") + 
+  annotate("text", x=-94.2, y=44.8, label= "4", size=6, fontface="bold", color="#009e73") + 
+  annotate("text", x=-93.8, y=42.2, label= "3", size=6, fontface="bold", color="#0072B2") + 
+  annotate("text", x=-93.4, y=39.9, label= "2", size=6, fontface="bold", color="#D55E00") + 
+  annotate("text", x=-93, y=37.8, label= "1", size=6, fontface="bold", color="#F0E442") + 
+  
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  xlab("") +
+  ylab("") +
+  ylim(ymin=30, ymax=52)+
+  xlim(Xmin=-96.8, ymax=-53)+
+  theme_classic() +
+  geom_point(data=stop.term.comp, aes(x = lon, y = lat, fill=Category, shape=Category),
+             color="black", size = 2, alpha=.7) +
+  scale_shape_manual(values=c(23, 22))+
+  scale_fill_manual(values=c("darkorange2","steelblue4"))+
+  theme(legend.position =  'none',
+        legend.title = element_blank(), 
+        legend.text= element_text(size = 12, face = "bold"), 
+        panel.border =  element_rect(size = 0.5, fill=NA, linetype = "solid", colour = "black"))
+
+
+
+Stop.plot
+
+
+stop.bar<- ggplot(stop.term.comp, aes(x=Category, y=lat, fill=Category, shape=Category))+
+  geom_boxplot(outlier.shape = NA, alpha=.6, )+
+  geom_point(color ="black", 
+             position = position_jitterdodge(dodge.width = 0, jitter.width = .5), 
+             size = 1.5, alpha = 0.6) +
+  xlab("")+
+  ylab("Latitude")+
+  scale_shape_manual(values=c(23, 22))+
+  scale_fill_manual(values=c("darkorange2","steelblue4"))+
+  theme_classic(base_size = 10)+
+  theme(axis.text.y= element_text(margin = margin(6, unit = "cm")),
+        legend.position = 'none')
+
+  
+stop.bar
+
+
+## place boxplot inside map
+
+#install.packages('patchwork')
+library(patchwork)
+
+Stop.combo<- Stop.plot + inset_element(stop.bar, left = 0.58, bottom = 0.005, right = 0.975, top = 0.5)
+
+## add additional panel showing distribution of over males
+
+SGSZone<- rep(c("1", "2", "3", "4", "5"),2)
+Male<- c(0,1,1,2,10,3,5,3,5,1)
+Category<- rep(c("Same zone-1", "Same zone-2", "Same zone-3", "Same zone-4", "Same zone-5", 
+                 "Different zone-1",
+                 "Different zone-2",
+                 "Different zone-3",
+                 "Different zone-4",
+                 "Different zone-5"))
+
+
+Scott.df<- data.frame(SGSZone=SGSZone,
+                      Male=Male,
+                     Category=Category)
+
+Scott.bar<- ggplot(Scott.df, aes(x=SGSZone, y=Male, color=SGSZone, fill=Category))+
+  geom_bar(stat = "identity", size=2)+
+  annotate("rect", xmin = .75, xmax = 1.25, ymin = 10.75, ymax = 11.75,
+           alpha = .5,
+           color="#009e73", fill="#009e73")+
+  annotate("rect", xmin = .75, xmax = 1.25, ymin = 9.5, ymax = 10.5,
+           alpha = 1,
+           color="#009e73", fill="#009e73")+
+  annotate("text", x = 1.83, y = 11.25,label="Different zone", size=4
+      )+
+  annotate("text", x = 1.75, y = 10,label="Same zone", size=4
+  )+
+  xlab("SGS zone")+
+  ylab("Number of males")+
+  scale_color_manual(values=c("#F0E442","#D55E00", "#0072B2",  "#009e73", "#E69F00"),
+                     guide="none")+
+  scale_fill_manual(name="SGS zone of stopover\n versus termination", 
+                    values=alpha(c("#F0E442","#D55E00", "#0072B2",  "#009e73","#E69F00",
+                                   "#F0E442","#D55E00", "#0072B2",  "#009e73", "#E69F00"),
+                      c(.5,.5,.5,.5,.5,
+                        1,1,1,1,1)),
+                    guide="none")+
+  theme_classic(base_size = 16)+
+  theme(axis.text.y= element_text(margin = margin(6, unit = "cm")),
+        # axis.text.x= element_text(angle = 45, vjust=0.5, hjust=.5),
+        legend.position = c(0.2,0.9),
+        plot.margin=unit(c(0,2,0,3), "cm")
+        )
+
+
+Scott.bar
+
+library(cowplot)
+library(ggplot2)
+Scott.grid<-plot_grid(Stop.combo, Scott.bar,
+                           labels = c("A", "B"), 
+                           label_size=15,
+                           ncol=1,
+                           rel_widths=c(4,1.5),
+                          rel_heights=c(2,1.3))
+
+Scott.grid
+
+
+
+ggsave("Figure5.jpeg", device="jpeg",
+       scale = 1, width = 8, height = 8.5, units = c("in"),
+       dpi = 600, limitsize = TRUE)
+
+#  ******** ****** Matching SGS zones with unique route numbers ***************
+
+zones <- read.csv('sgs_data_zone_tab.csv')  
+surv <- read.csv('sgs_data_survey_tab.csv')
+disc <- read.csv('discontinued_routes.csv')
+
+# check data
+head(zones)
+head(surv)
+
+# add zone and route id to both dfs
+zones$statert <- paste0(zones$state_cd, '_', zones$route_cd)
+surv$statert <- paste0(surv$stprovrtecode, '_', surv$routenumber)
+disc$statert <- paste0(disc$state_cd, '_', disc$route_cd)
+
+dt <- full_join(surv, zones)
+
+# reformat dates
+dt$month <- as.character(dt$month)
+dt$day <- as.character(dt$day)
+length(dt$month[which(is.na(dt$month)==TRUE)])
+length(dt$month[which(is.na(dt$day)==TRUE)])
+
+# correct the missing one that Becky was able to find the information for
+dt$month[which(dt$statert=='90_33'&dt$month==9)] <- 5
+
+# get rid of NA's in month and day
+# gets rid of 91 observations with no month or day, 
+#~ 30 of which a survey actually took place, the rest no survey seems to have taken place
+dt <- dt[which(is.na(dt$month)==F & is.na(dt$day)==F),]
+
+# Then make sure they are all in a 2 digit format
+dt$month <- paste0(0,dt$month)
+for (i in 1:nrow(dt)){
+  if (as.numeric(dt$day[i])<10){
+    dt$day[i] <- paste0('0', dt$day[i])
+  }
+}
+
+# then merge together into a date format
+dt$date <- paste0(dt$surveyyear, '-', dt$month, '-', dt$day, " 00:00:00")
+head(dt)
+
+# then need to fill in zones for discontinued routes I think... 
+# 21 10 is discontinued...
+dt[which(dt$statert=='21_10'),]
+length(which(is.na(dt$state_cd)==T))
+dt$discontinued <- 'N' # column to indicate whether discontinued
+
+missing_cd <- unique(dt$statert[which(is.na(dt$state_cd)==T)])
+length(missing_cd) # 464 routes missing a code
+
+# only need unique ids of discontinued routes to get the zone
+head(disc)
+disc <- disc[which(disc$discontinued=='YES'), 3:ncol(disc)]
+
+# indicated discontinued ids into main data frame
+dt$discontinued[which(dt$statrt %in% disc$statert == T)] <- 'Y'
+
+test <- left_join(disc, zones)
+test$SurveyZone # most of these have NA for zone
+known_disc_zones <- test[which(is.na(test$SurveyZone)==F),c(9,12)] # 25 left here
+
+# fill in known zones for discontinued routes in main data frame
+for (i in 1:nrow(known_disc_zones)){
+  dt$SurveyZone[which(dt$statert==known_disc_zones$statert[i])] <- known_disc_zones$SurveyZone[i]
+}
+
+#nrow(dt) #43415 to 37953
+dt <- dt[which(is.na(dt$SurveyZone)==F),]
+head(dt)
+
+dt$date <- as_datetime(dt$date)
+
+# there were 48 that the dates 'failed to parse'
+# they all have impossible dates, placeholders for missing data according to Becky
+dt <- dt[which(is.na(dt$date)==F),]
+nrow(dt) #37905 left
+
+zone_starts <- data.frame(zone=1:5,
+                          start_month=c('04','04','04','04','05'),
+                          start_day=c('10','15','20','25','01'))
+
+dt$start_month <- NA
+dt$start_day <- NA
+for (i in 1:nrow(zone_starts)){
+  dt$start_month[which(dt$SurveyZone==zone_starts$zone[i])] <- zone_starts$start_month[i]
+  dt$start_day[which(dt$SurveyZone==zone_starts$zone[i])] <- zone_starts$start_day[i]
+}
+
+dt$start_date <- as_datetime(paste0(dt$surveyyear,'-', dt$start_month, '-' ,dt$start_day))
+dt$index <- as.numeric(dt$date-dt$start_date, units='days')
+
+#write.csv(dt, 'G:\\My Drive\\Woodcock\\Erik SGS paper\\sgs_routes_complete.csv')
+
+# then subset to only 2017 and later #** Edited 4/12/2023
+dt <- dt[which(dt$surveyyear>2016),] # because the data only goes to 2022 anyway
+#nrow(dt) # 4472
+
+# Make data with one column for survey day and one for zone, for plot to count
+surv.zone.date<- data.frame(sdate=dt$index, zone=dt$SurveyZone)
+write.csv(surv.zone.date, file='G:\\My Drive\\Woodcock\\Erik SGS paper\\surv_zone_date_fig4_rev_041223.csv')
+
+## ********************cummulative # of birds migrating by zone ****************************
+# Changed to calculate on discrete SGS days instead of quantiles of birds
+
+max.stop<- aggregate(amwo.mig.term$SGSDay ~ amwo.mig.term$ID.site , FUN="max") # amwo.mig.term has sections of a day too
+max.zone<- aggregate(as.numeric(amwo.mig.term$SGSZone) ~ amwo.mig.term$ID.site , FUN="max")
+
+max.both <- data.frame(cbind(max.stop, max.zone))
+colnames(max.both)<- c("ID1", "SGSDay", "ID", "Zone")
+#View(max.both)
+
+
+# convert the sgsday in max.both to just the day (floor rounds to the previous number)
+max.both$SGSDay <- floor(max.both$SGSDay)
+
+
+
+#saveRDS(max.both, file='G:\\My Drive\\Woodcock\\Erik SGS paper\\max.both.rds')
+#max.both <- readRDS('G:\\My Drive\\Woodcock\\Erik SGS paper\\max.both.rds')
+
+max.both.5<- subset(max.both, max.both$Zone==1)
+max.both.4<- subset(max.both, max.both$Zone==2)
+max.both.3<- subset(max.both, max.both$Zone==3)
+max.both.2<- subset(max.both, max.both$Zone==4)
+max.both.1<- subset(max.both, max.both$Zone==5)
+
+# re-make these data frames
+
+hist.5 <- data.frame(SGSDay=seq(min(max.both.5$SGSDay), max(max.both.5$SGSDay)), count=NA)
+for (i in 1:nrow(hist.5)){ # number of bird terminations on that day
+  hist.5$count[i] <- length(which(max.both.5$SGSDay==hist.5$SGSDay[i]))
+}
+pct.5 <- cumsum(hist.5$count)/sum(hist.5$count) # cumulative percent on that day
+nrow(hist.5) #24
+q5 <- data.frame(SGSDay=hist.5$SGSDay, PCT=pct.5)
+q5$cumpct<- 0.64 + q5$PCT*0.36 
+q5[25,] <- NA
+q5$SGSDay[25]<-30
+q5$cumpct[25]<-1.0
+q5$zone <- 5
+
+
+hist.4 <- data.frame(SGSDay=seq(min(max.both.4$SGSDay), max(max.both.4$SGSDay)), count=NA)
+for (i in 1:nrow(hist.4)){ # number of bird terminations on that day
+  hist.4$count[i] <- length(which(max.both.4$SGSDay==hist.4$SGSDay[i]))
+}
+pct.4 <- cumsum(hist.4$count)/sum(hist.4$count) 
+nrow(hist.4) #43
+q4 <- data.frame(SGSDay=hist.4$SGSDay, PCT=pct.4)
+q4$cumpct<- 0.82+ q4$PCT*0.18 # 
+#q4[44,] <- NA
+#q4$SGSDay[44] <- 30
+#q4$cumpct[44] <- 1.0
+q4$zone <- 4
+
+
+hist.3 <- data.frame(SGSDay=seq(min(max.both.3$SGSDay), max(max.both.3$SGSDay)), count=NA)
+for (i in 1:nrow(hist.3)){ # number of bird terminations on that day
+  hist.3$count[i] <- length(which(max.both.3$SGSDay==hist.3$SGSDay[i]))
+}
+pct.3 <- cumsum(hist.3$count)/sum(hist.3$count) 
+nrow(hist.3) #22
+q3 <- data.frame(SGSDay=hist.3$SGSDay, PCT=pct.3)
+q3$cumpct<- 0.90 + q3$PCT*0.10 
+q3[23,] <- NA
+q3$SGSDay[23]<-30
+q3$cumpct[23]<-1.0
+q3$zone <- 3
+
+hist.2 <- data.frame(SGSDay=seq(min(max.both.2$SGSDay), max(max.both.2$SGSDay)), count=NA)
+for (i in 1:nrow(hist.2)){ # number of bird terminations on that day
+  hist.2$count[i] <- length(which(max.both.2$SGSDay==hist.2$SGSDay[i]))
+}
+pct.2 <- cumsum(hist.2$count)/sum(hist.2$count) 
+nrow(hist.2) #28
+q2 <- data.frame(SGSDay=hist.2$SGSDay, PCT=pct.2)
+q2$cumpct<- 0.91 + q2$PCT*0.09 
+q2[29,] <- NA
+q2$SGSDay[29]<-30
+q2$cumpct[29]<-1.0
+q2$zone <- 2
+
+hist.1 <- data.frame(SGSDay=seq(min(max.both.1$SGSDay), max(max.both.1$SGSDay)), count=NA)
+for (i in 1:nrow(hist.1)){ # number of bird terminations on that day
+  hist.1$count[i] <- length(which(max.both.1$SGSDay==hist.1$SGSDay[i]))
+}
+pct.1 <- cumsum(hist.1$count)/sum(hist.1$count) 
+nrow(hist.1) #8
+q1 <- data.frame(SGSDay=hist.1$SGSDay, PCT=pct.1)
+q1$cumpct<-0.955 + q1$PCT*0.045
+q1[9,] <- NA
+q1$SGSDay[9]<-30
+q1$cumpct[9]<-1.0
+q1$zone <- 1
+
+q<- rbind(q5, q4, q3, q2, q1)
+
+u <- q
+
+#write.csv(q, "G:\\My Drive\\Woodcock\\Erik SGS paper\\Figure4data_revised_041223.csv")
+#u<- read.csv("G:\\My Drive\\Woodcock\\Erik SGS paper\\Figure4data_revised.csv")
+
+sgs.day.dens<- ggplot(u, aes(x=SGSDay, cumpct, group=as.factor(zone), color=as.factor(zone)))+
+  annotate("rect", xmin = 0, xmax = 20, ymin = 0.6, ymax = 1.025,
+           alpha = .6, fill = "gray", color='dark gray')+
+  geom_step(size=2, direction="vh")+
+  # geom_point(color ="black" , shape = 21,  
+  #           position = position_jitterdodge(dodge.width = 0, jitter.width = .25), size = 2.5, alpha = 0.9) +
+  #geom_hline(yintercept=0, colour='red', linetype='dashed')+
+  #  coord_flip()+
+  xlab("")+
+  ylab("Proportion of \nmigration completed")+
+  scale_x_continuous(limits = c(0,30), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0.6, 1.025), expand = c(0, 0)) +
+  scale_color_manual(name="SGS Zone",
+                     #guide = "none",
+                     #breaks=c("1", "2", "3", "4", "5"),
+                     #labels=c("1", "2", "3", "4", "5"),
+                     values=c("#F0E442","#D55E00", "#0072B2",  "#009e73", '#E69F00')) + #
+  
+  guides(linetype="none")+
+  theme_classic(base_size = 14)+
+  theme(legend.position = c(0.85, 0.3),
+        legend.direction = "vertical")
+
+sgs.day.dens
+
+
+#surv.zone.date <- read.csv('G:\\My Drive\\Woodcock\\Erik SGS paper\\surv_zone_date_fig4.csv')
+
+## ggridges graph for survey date
+
+library(ggridges)
+
+survey.date.plot<- ggplot(surv.zone.date, aes(x=sdate, fill=as.factor(zone)))+
+  geom_density_ridges(aes(y=fct_rev(as.factor(zone))), alpha=0.8, size=1, scale=1.5)+
+  # geom_point(color ="black" , shape = 21,  
+  #           position = position_jitterdodge(dodge.width = 0, jitter.width = .25), size = 2.5, alpha = 0.9) +
+  #geom_hline(yintercept=0, colour='red', linetype='dashed')+
+  #  coord_flip()+
+  xlab("Day of SGS Window")+
+  ylab("SGS Zone \n ")+
+  scale_x_continuous(limits = c(0,30), expand = c(.01, 0)) +
+  scale_fill_manual(name="SGS Zone",
+                    #guide = "none",
+                    breaks=c("1", "2", "3", "4", "5"),
+                    labels=c("1", "2", "3", "4", "5"),
+                    values=c("#F0E442","#D55E00", "#0072B2",  "#009e73", "#E69F00")) +
+  guides(linetype="none")+
+  theme_classic(base_size = 16)+
+  theme(legend.position = "none")
+#  axis.text.y = element_text(angle = 45))
+survey.date.plot
+
+library(cowplot)
+
+date.grid<-cowplot::plot_grid(sgs.day.dens, survey.date.plot,
+                              labels = c("A", "B"), 
+                              label_size=15,
+                              ncol=1,
+                              rel_widths=c(4,1.5),
+                              rel_heights=c(2,1.3))
+
+
+# ******** find out percent of migrating birds functionally available for survey ******
+
+#u <- read.csv("G:\\My Drive\\Woodcock\\Erik SGS paper\\Figure4data_revised.csv")
+#z <- read.csv('G:\\My Drive\\Woodcock\\Erik SGS paper\\surv_zone_date_fig4.csv')
+z <- surv.zone.date
+
+# Come up with proportion of completed routes by day
+
+# need a data frame with survey dates, zones, and count of surveys , cumulative pct on each date
+q <- z %>% group_by(zone, sdate) %>% 
+  count() %>% ungroup () %>%
+  group_by(zone)%>%
+  mutate(total=sum(n)) %>% ungroup() %>%
+  mutate(surv_pct=n/total) %>%
+  group_by(zone) %>%
+  mutate(cumpct_surv = cumsum(surv_pct)) %>% 
+  ungroup() %>% as.data.frame()
+
+head(q)
+head(u)
+
+# Match survey proportions to bird proportions
+for (i in 1:nrow(u)){
+  for (j in 1:nrow(q)){
+    if (u$SGSDay[i]==q$sdate[j]&u$zone[i]==q$zone[j]){
+      u$surv_pct[i] <- q$surv_pct[j]
+      u$cumpct_surv[i] <- q$cumpct_surv[j]
+    }
+    
+  }
+}
+
+# put rest of survey days in zone 1 to show 0's
+# not sure if this is necessary
+u[129:151,] <- NA
+u$SGSDay[129:151] <- 8:30
+u$zone[129:151] <- 1 
+u$PCT[129:151] <- 1
+u$surv_pct[129:151]<- 0.00
+
+
+# PCT is the cumulative proportion of woodcock that have completed migration in each zone in each survey day
+# cumpct is the cumulative proportion that have completed migration in that zone corrected for survey density
+# surv_pct is the proportion of surveys completed in that zone during that day
+# cumpct_surv is the cumulative proportion of surveys that have been completed in that zone
+
+# percent of surveys completed each day * percent of birds still migrating on each day
+u$index <- u$surv_pct* (1-u$cumpct)
+
+
+# plot of index over time
+pl<- ggplot(u, aes(x=SGSDay, index, group=as.factor(zone), color=as.factor(zone)))+
+  #annotate("rect", xmin = 0, xmax = 20, ymin = 0.6, ymax = 1.025,
+  #         alpha = .6, fill = "gray", color='dark gray')+
+  geom_line(size=2)+
+  xlab("SGS Day")+
+  ylab("Proportion per day")+ # might be a better axis title for this
+  scale_x_continuous(limits = c(0,25), expand = c(0, 0)) +
+  #scale_y_continuous(limits = c(0.6, 1.025), expand = c(0, 0)) +
+  scale_color_manual(name="SGS Zone",
+                     values=c("#F0E442","#D55E00", "#0072B2",  "#009e73", '#E69F00')) + #
+  
+  guides(linetype="none")+
+  theme_classic(base_size = 14)+
+  theme(legend.position = c(0.85, 0.5),
+        legend.direction = "vertical")
+
+pl 
+
+# find net percent 
+u_1 <- u[which(u$SGSDay<21),]
+u_1 <- na.omit(u_1)
+
+net_pct <- data.frame(zone = 1:5, net_pct_migrant=NA)
+for (i in 1:5){
+  
+  net_pct$net_pct_migrant[i] <-sum(u_1$index[which(u_1$zone==net_pct$zone[i])])
+  
+  
+}
+net_pct
+
+# final data frame
+#write.csv(net_pct, file='G:\\My Drive\\Woodcock\\Erik SGS paper\\net_pct_migrant.csv')
+
+
+
+
+# check data
+head(zones)
+head(surv)
+
+# add zone and route id to both dfs
+zones$statert <- paste0(zones$state_cd, '_', zones$route_cd)
+surv$statert <- paste0(surv$stprovrtecode, '_', surv$routenumber)
+disc$statert <- paste0(disc$state_cd, '_', disc$route_cd)
+
+library(dplyr)
+
+dt <- full_join(surv, zones)
+
+# reformat dates
+dt$month <- as.character(dt$month)
+dt$day <- as.character(dt$day)
+length(dt$month[which(is.na(dt$month)==TRUE)])
+length(dt$month[which(is.na(dt$day)==TRUE)])
+
+# correct the missing one that Becky was able to find the information for
+dt$month[which(dt$statert=='90_33'&dt$month==9)] <- 5
+
+# get rid of NA's in month and day
+# gets rid of 91 observations with no month or day, 
+#~ 30 of which a survey actually took place, the rest no survey seems to have taken place
+dt <- dt[which(is.na(dt$month)==F & is.na(dt$day)==F),]
+
+# Then make sure they are all in a 2 digit format
+dt$month <- paste0(0,dt$month)
+for (i in 1:nrow(dt)){
+  if (as.numeric(dt$day[i])<10){
+    dt$day[i] <- paste0('0', dt$day[i])
+  }
+}
+
+# then merge together into a date format
+dt$date <- paste0(dt$surveyyear, '-', dt$month, '-', dt$day, " 00:00:00")
+head(dt)
+
+# then need to fill in zones for discontinued routes I think... 
+# 21 10 is discontinued...
+dt[which(dt$statert=='21_10'),]
+length(which(is.na(dt$state_cd)==T))
+dt$discontinued <- 'N' # column to indicate whether discontinued
+
+missing_cd <- unique(dt$statert[which(is.na(dt$state_cd)==T)])
+length(missing_cd) # 464 routes missing a code
+
+# only need unique ids of discontinued routes to get the zone
+head(disc)
+disc <- disc[which(disc$discontinued=='YES'), 3:ncol(disc)]
+
+# indicated discontinued ids into main data frame
+dt$discontinued[which(dt$statrt %in% disc$statert == T)] <- 'Y'
+
+test <- left_join(disc, zones)
+test$SurveyZone # most of these have NA for zone
+known_disc_zones <- test[which(is.na(test$SurveyZone)==F),c(9,12)] # 25 left here
+
+# fill in known zones for discontinued routes in main data frame
+for (i in 1:nrow(known_disc_zones)){
+  dt$SurveyZone[which(dt$statert==known_disc_zones$statert[i])] <- known_disc_zones$SurveyZone[i]
+}
+
+#nrow(dt) #43415 to 37953
+dt <- dt[which(is.na(dt$SurveyZone)==F),]
+head(dt)
+
+library(lubridate)
+
+dt$date <- as_datetime(dt$date)
+
+# there were 48 that the dates 'failed to parse'
+# they all have impossible dates, placeholders for missing data according to Becky
+dt <- dt[which(is.na(dt$date)==F),]
+nrow(dt) #37905 left
+
+zone_starts <- data.frame(zone=1:5,
+                          start_month=c('04','04','04','04','05'),
+                          start_day=c('10','15','20','25','01'))
+
+dt$start_month <- NA
+dt$start_day <- NA
+for (i in 1:nrow(zone_starts)){
+  dt$start_month[which(dt$SurveyZone==zone_starts$zone[i])] <- zone_starts$start_month[i]
+  dt$start_day[which(dt$SurveyZone==zone_starts$zone[i])] <- zone_starts$start_day[i]
+}
+
+dt$start_date <- as_datetime(paste0(dt$surveyyear,'-', dt$start_month, '-' ,dt$start_day))
+dt$index <- as.numeric(dt$date-dt$start_date, units='days')
+
+write.csv(dt, 'sgs_routes_complete.csv')
+
+
+# Make data with one column for survey day and one for zone, for plot to count
+surv.zone.date<- data.frame(sdate=dt$index, zone=dt$SurveyZone)
+
+## extract just zone 5 surveys
+
+surv.zone.date5<- subset(surv.zone.date, surv.zone.date$zone==5)
+
+hist(surv.zone.date5$sdate)
+z5quant<- quantile(surv.zone.date5$sdate, probs=seq(0,1,0.01))
+z5quant
+
+write.csv(surv.zone.date, file='surv_zone_date_fig4.csv')
+
+
+## ********************cumulative # of birds migrating by zone ****************************
+
+max.stop<- aggregate(amwo.mig.term$SGSDay ~ amwo.mig.term$ID.site , FUN="max") # amwo.mig.term has sections of a day too
+max.zone<- aggregate(as.numeric(amwo.mig.term$SGSZone) ~ amwo.mig.term$ID.site , FUN="max")
+
+
+
+max.both <- data.frame(cbind(max.stop, max.zone))
+
+colnames(max.both)<- c("ID1", "SGSDay", "ID", "Zone")
+
+# convert the sgsday in max.both to just the day (floor rounds to the previous number)
+
+max.both$SGSDay <- floor(max.both$SGSDay)
+
+
+max.both.5<- subset(max.both, max.both$Zone==1)
+max.both.4<- subset(max.both, max.both$Zone==2)
+max.both.3<- subset(max.both, max.both$Zone==3)
+max.both.2<- subset(max.both, max.both$Zone==4)
+max.both.1<- subset(max.both, max.both$Zone==5)
+
+# re-make these data frames
+
+hist.5 <- data.frame(SGSDay=seq(min(max.both.5$SGSDay), max(max.both.5$SGSDay)), count=NA)
+for (i in 1:nrow(hist.5)){ # number of bird terminations on that day
+  hist.5$count[i] <- length(which(max.both.5$SGSDay==hist.5$SGSDay[i]))
+}
+pct.5 <- cumsum(hist.5$count)/sum(hist.5$count) # cumulative percent on that day
+nrow(hist.5) #24
+active.5<- 1-pct.5
+
+q5 <- data.frame(SGSDay=hist.5$SGSDay, Active=active.5)
+q5$cumpct<- 0.64 + 0.36*(1-q5$Active)
+q5[25,] <- NA
+q5$SGSDay[25]<-30
+q5$cumpct[25]<-1.0
+q5$zone <- 5
+
+
+q5b <- data.frame(SGSDay=hist.5$SGSDay, PCT=pct.5)
+q5b$cumpct<- 0.64 + q5b$PCT*0.36 
+q5b[25,] <- NA
+q5b$SGSDay[25]<-30
+q5b$cumpct[25]<-1.0
+q5b$zone <- 5
+
+
+
+hist.4 <- data.frame(SGSDay=seq(min(max.both.4$SGSDay), max(max.both.4$SGSDay)), count=NA)
+for (i in 1:nrow(hist.4)){ # number of bird terminations on that day
+  hist.4$count[i] <- length(which(max.both.4$SGSDay==hist.4$SGSDay[i]))
+}
+pct.4 <- cumsum(hist.4$count)/sum(hist.4$count) 
+nrow(hist.4) #43
+q4 <- data.frame(SGSDay=hist.4$SGSDay, PCT=pct.4)
+q4$cumpct<- 0.82+ q4$PCT*0.18 # 
+#q4[44,] <- NA
+#q4$SGSDay[44] <- 30
+#q4$cumpct[44] <- 1.0
+q4$zone <- 4
+
+
+hist.3 <- data.frame(SGSDay=seq(min(max.both.3$SGSDay), max(max.both.3$SGSDay)), count=NA)
+for (i in 1:nrow(hist.3)){ # number of bird terminations on that day
+  hist.3$count[i] <- length(which(max.both.3$SGSDay==hist.3$SGSDay[i]))
+}
+pct.3 <- cumsum(hist.3$count)/sum(hist.3$count) 
+nrow(hist.3) #22
+q3 <- data.frame(SGSDay=hist.3$SGSDay, PCT=pct.3)
+q3$cumpct<- 0.90 + q3$PCT*0.10 
+q3[23,] <- NA
+q3$SGSDay[23]<-30
+q3$cumpct[23]<-1.0
+q3$zone <- 3
+
+hist.2 <- data.frame(SGSDay=seq(min(max.both.2$SGSDay), max(max.both.2$SGSDay)), count=NA)
+for (i in 1:nrow(hist.2)){ # number of bird terminations on that day
+  hist.2$count[i] <- length(which(max.both.2$SGSDay==hist.2$SGSDay[i]))
+}
+pct.2 <- cumsum(hist.2$count)/sum(hist.2$count) 
+nrow(hist.2) #28
+q2 <- data.frame(SGSDay=hist.2$SGSDay, PCT=pct.2)
+q2$cumpct<- 0.91 + q2$PCT*0.09 
+q2[29,] <- NA
+q2$SGSDay[29]<-30
+q2$cumpct[29]<-1.0
+q2$zone <- 2
+
+hist.1 <- data.frame(SGSDay=seq(min(max.both.1$SGSDay), max(max.both.1$SGSDay)), count=NA)
+for (i in 1:nrow(hist.1)){ # number of bird terminations on that day
+  hist.1$count[i] <- length(which(max.both.1$SGSDay==hist.1$SGSDay[i]))
+}
+pct.1 <- cumsum(hist.1$count)/sum(hist.1$count) 
+nrow(hist.1) #8
+q1 <- data.frame(SGSDay=hist.1$SGSDay, PCT=pct.1)
+q1$cumpct<-0.955 + q1$PCT*0.045
+q1[9,] <- NA
+q1$SGSDay[9]<-30
+q1$cumpct[9]<-1.0
+q1$zone <- 1
+
+q<- rbind(q5, q4, q3, q2, q1)
+
+u <- q
+
+library(ggplot2)
+#write.csv(q, "G:\\My Drive\\Woodcock\\Erik SGS paper\\Figure4data_revised.csv")
+#u<- read.csv("G:\\My Drive\\Woodcock\\Erik SGS paper\\Figure4data_revised.csv")
+
+sgs.day.dens<- ggplot(u, aes(x=SGSDay, cumpct, group=as.factor(zone), color=as.factor(zone)))+
+  annotate("rect", xmin = 1, xmax = 20, ymin = 0.6, ymax = 1.025,
+           alpha = .6, fill = "gray", color='dark gray')+
+  geom_step(size=2, direction="vh")+
+  xlab("")+
+  ylab("Proportion of \nmigration completed")+
+  scale_x_continuous(limits = c(1,30), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0.6, 1.025), expand = c(0, 0)) +
+  scale_color_manual(name="SGS Zone",
+                    values=c("#F0E442","#D55E00", "#0072B2",  "#009e73", '#E69F00')) + #
+  
+  guides(linetype="none")+
+  theme_classic(base_size = 14)+
+  theme(legend.position = c(0.85, 0.3),
+        legend.direction = "vertical")
+
+sgs.day.dens
+
+## ggridges graph for survey date
+
+library(ggridges)
+library(forcats)
+
+survey.date.plot<- ggplot(surv.zone.date, aes(x=sdate, fill=as.factor(zone)))+
+  geom_density_ridges(aes(y=fct_rev(as.factor(zone))), alpha=0.8, size=1, scale=1.5)+
+  xlab("Day of SGS window")+
+  ylab("SGS zone \n ")+
+  scale_x_continuous(limits = c(1,30), expand = c(.01, 0)) +
+  scale_fill_manual(name="SGS Zone",
+                    breaks=c("1", "2", "3", "4", "5"),
+                    labels=c("1", "2", "3", "4", "5"),
+                    values=c("#F0E442","#D55E00", "#0072B2",  "#009e73", "#E69F00")) +
+  guides(linetype="none")+
+  theme_classic(base_size = 16)+
+  theme(legend.position = "none")
+
+survey.date.plot
+
+
+library(cowplot)
+
+date.grid<-cowplot::plot_grid(sgs.day.dens, survey.date.plot,
+                              labels = c("A", "B"), 
+                              label_size=15,
+                              ncol=1,
+                              rel_widths=c(4,1.5),
+                              rel_heights=c(2,1.5))
+
+
+
+
+ggsave("Figure4.jpeg", device="jpeg",
+       scale = 1, width = 4, height = 6, units = c("in"),
+       dpi = 600, limitsize = TRUE)
+
